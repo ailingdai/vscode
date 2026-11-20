@@ -126,12 +126,14 @@ import { CancellationError } from '../../util/vs/base/common/errors';
 import { Disposable, IDisposable } from '../../util/vs/base/common/lifecycle';
 import { derivedOpts, IObservable } from '../../util/vs/base/common/observable';
 import { IObservableWithChange } from '../../util/vs/base/common/observableInternal';
+import { splitLines } from '../../util/vs/base/common/strings';
 import { URI } from '../../util/vs/base/common/uri';
 import { generateUuid } from '../../util/vs/base/common/uuid';
 import { StringReplacement } from '../../util/vs/editor/common/core/edits/stringEdit';
 import { OffsetRange } from '../../util/vs/editor/common/core/ranges/offsetRange';
 import { SyncDescriptor } from '../../util/vs/platform/instantiation/common/descriptors';
 import { IInstantiationService } from '../../util/vs/platform/instantiation/common/instantiation';
+import { ExtHostDocumentData } from '../../util/vs/workbench/api/common/extHostDocumentData';
 export {
 	IAuthenticationService, ICAPIClientService, IEndpointProvider, IExperimentationService, IIgnoreService, ILanguageContextProviderService
 };
@@ -217,6 +219,19 @@ export interface INESProviderOptions {
 	 * {@link TestLanguageDiagnosticsService} that returns empty diagnostics
 	 */
 	readonly languageDiagnosticsService?: ILanguageDiagnosticsService;
+	/**
+	 * Language context (for example declarations from the host IDE's code model)
+	 * offered to the NES prompt when `languageContext.enabled` is on. When omitted,
+	 * falls back to {@link NullLanguageContextProviderService}, which offers none.
+	 *
+	 * NES calls `getContextProviders(document, ProviderTarget.NES)`, then
+	 * `getContextItems` within the request's time budget, then
+	 * `getContextItemsOnTimeout`. `document` is the current state of the
+	 * {@link workspace} document, with its language ID. The provider owns
+	 * selector matching and content exclusion: chat-lib does not filter
+	 * Copilot-ignored snippets. The caller owns the provider's lifetime.
+	 */
+	readonly languageContextProvider?: ILanguageContextProviderService;
 	/**
 	 * Tokenizer provider backing prompt rendering and token budgeting. When
 	 * omitted, falls back to the built-in {@link TokenizerProvider}, which
@@ -503,11 +518,19 @@ function setupServices(options: INESProviderOptions) {
 	builder.define(IConfigurationService, new SyncDescriptor(OverridableConfigurationService, [options.configOverrides ?? new Map()]));
 	builder.define(IExperimentationService, new SyncDescriptor(SimpleExperimentationService, [options.waitForTreatmentVariables]));
 	builder.define(ISimulationTestContext, new SyncDescriptor(NulSimulationTestContext));
-	builder.define(IWorkspaceService, new SyncDescriptor(NullWorkspaceService));
+	builder.define(IWorkspaceService, new class extends NullWorkspaceService {
+		override get textDocuments(): vscode.TextDocument[] {
+			return options.workspace.openDocuments.get().map(toTextDocument);
+		}
+		// Keeps cross-file edits off, as before: they open their target document through this service.
+		override async openTextDocument(uri: vscode.Uri): Promise<vscode.TextDocument> {
+			throw new Error(`Unknown document: ${uri}`);
+		}
+	});
 	builder.define(IDiffService, new SyncDescriptor(DiffServiceImpl, [false]));
 	builder.define(ILogService, new SyncDescriptor(LogServiceImpl, [[logTarget || new ConsoleLog(undefined, InternalLogLevel.Trace)]]));
 	builder.define(IGitExtensionService, new SyncDescriptor(NullGitExtensionService));
-	builder.define(ILanguageContextProviderService, new SyncDescriptor(NullLanguageContextProviderService));
+	builder.define(ILanguageContextProviderService, options.languageContextProvider ?? new SyncDescriptor(NullLanguageContextProviderService));
 	builder.define(ILanguageDiagnosticsService, options.languageDiagnosticsService || new SyncDescriptor(TestLanguageDiagnosticsService));
 	builder.define(IIgnoreService, new SyncDescriptor(NullIgnoreService));
 	builder.define(ISnippyService, new SyncDescriptor(NullSnippyService));
@@ -553,6 +576,17 @@ function setupServices(options: INESProviderOptions) {
 	}
 	builder.define(ICompletionsConfigProvider, configProvider);
 	return builder.seal();
+}
+
+/**
+ * Snapshots an NES workspace document as a `vscode.TextDocument`, so services
+ * written against `IWorkspaceService` see the same text NES prompts with.
+ */
+function toTextDocument(doc: IObservableDocument): vscode.TextDocument {
+	const text = doc.value.get().value;
+	const saveDelegate = { $trySaveDocument: () => Promise.reject(new Error('Not supported')) };
+	// Lenient instanceof checks accept position-like objects from embedders.
+	return new ExtHostDocumentData(saveDelegate, doc.id.toUri(), splitLines(text), text.includes('\r\n') ? '\r\n' : '\n', doc.version.get(), doc.languageId.get(), false, 'utf8', false).document;
 }
 
 class OverridableConfigurationService extends DefaultsOnlyConfigurationService {

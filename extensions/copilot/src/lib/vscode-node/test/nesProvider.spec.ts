@@ -10,11 +10,16 @@ dotenv.config({ path: '../.env' });
 import { promises as fs } from 'fs';
 import { outdent } from 'outdent';
 import * as path from 'path';
+import type { TextDocument } from 'vscode';
 import { assert, describe, expect, it } from 'vitest';
 import { CopilotToken, createTestExtendedTokenInfo } from '../../../platform/authentication/common/copilotToken';
 import { ICopilotTokenManager } from '../../../platform/authentication/common/copilotTokenManager';
+import { Copilot } from '../../../platform/inlineCompletions/common/api';
 import { DocumentId } from '../../../platform/inlineEdits/common/dataTypes/documentId';
+import { LanguageId } from '../../../platform/inlineEdits/common/dataTypes/languageId';
 import { MutableObservableWorkspace } from '../../../platform/inlineEdits/common/observableWorkspace';
+import { NullLanguageContextProviderService } from '../../../platform/languageContextProvider/common/nullLanguageContextProviderService';
+import { ContextItem, ContextKind } from '../../../platform/languageServer/common/languageContextService';
 import { ILanguageDiagnosticsService } from '../../../platform/languages/common/languageDiagnosticsService';
 import { TestLanguageDiagnosticsService } from '../../../platform/languages/common/testLanguageDiagnosticsService';
 import { FetchOptions, IAbortController, IHeaders, PaginationOptions, Response } from '../../../platform/networking/common/fetcherService';
@@ -432,6 +437,71 @@ describe('NESProvider Facade', () => {
 		expect(logTarget.logs.length).toBeGreaterThan(0);
 		const errorLogs = logTarget.logs.filter(l => l.level === LogLevel.Error);
 		assert.strictEqual(errorLogs.length, 0, `Unexpected error logs: ${JSON.stringify(errorLogs, null, 2)}`);
+	});
+
+	it('offers the current document to the embedder language context provider and prompts with its snippets', async () => {
+		const workspace = new MutableObservableWorkspace();
+		const doc = workspace.addDocument({
+			id: DocumentId.create(URI.file('/test/test.ts').toString()),
+			languageId: LanguageId.create('typescript'),
+			initialValue: outdent`
+				class Point {
+					constructor(
+						private readonly x: number,
+						private readonly y: number,
+					) { }
+				}`.trimStart(),
+		});
+		const snippet = 'interface Vector3 { readonly z: number }';
+		const requests: { text: string; languageId: string; offset: number }[] = [];
+		const languageContextProvider = new class extends NullLanguageContextProviderService {
+			override getContextProviders(): Copilot.ContextProvider<Copilot.SupportedContextItem>[] {
+				return [{ id: 'embedder', selector: '*', resolver: { resolve: async () => [] } }];
+			}
+			override async *getContextItems(document: TextDocument, request: Copilot.ResolveRequest): AsyncIterable<ContextItem> {
+				requests.push({ text: document.getText(), languageId: document.languageId, offset: request.documentContext.offset });
+				yield { kind: ContextKind.Snippet, priority: 1, uri: URI.file('/test/vector.ts'), value: snippet };
+			}
+		};
+		const fetcher = new TestFetcher({
+			'/models': JSON.stringify({ models: [] }),
+			'/chat/completions': await fs.readFile(path.join(__dirname, 'nesProvider.reply.txt'), 'utf8'),
+		});
+		const nextEditProvider = createNESProvider({
+			workspace,
+			fetcher,
+			copilotTokenManager: new TestCopilotTokenManager(),
+			telemetrySender: new TestTelemetrySender(),
+			terminalService: new NullTerminalService(),
+			logTarget: new TestLogTarget(),
+			editorInfo: { name: 'my-editor', version: '1.2.3' },
+			editorPluginInfo: { name: 'my-plugin', version: '4.5.6' },
+			configOverrides: new Map([['chat.advanced.inlineEdits.xtabProvider.languageContext.enabled', true]]),
+			languageContextProvider,
+		});
+		nextEditProvider.updateTreatmentVariables({
+			'config.github.copilot.chat.advanced.inlineEdits.xtabProvider.defaultModelConfigurationString': '{ "modelName": "xtab-test", "promptingStrategy": "copilotNesXtab", "includeTagsInCurrentFile": false }',
+		});
+
+		doc.applyEdit(StringEdit.insert(11, '3D'));
+		doc.setSelection([new OffsetRange(13, 13)], undefined);
+		await nextEditProvider.getNextEdit(doc.id.toUri(), CancellationToken.None);
+		nextEditProvider.dispose();
+
+		assert.deepStrictEqual(requests, [{
+			text: outdent`
+				class Point3D {
+					constructor(
+						private readonly x: number,
+						private readonly y: number,
+					) { }
+				}`.trimStart(),
+			languageId: 'typescript',
+			offset: 13,
+		}]);
+		const completionRequest = fetcher.requests.find(request => request.url.endsWith('/chat/completions'));
+		assert(completionRequest, `Unexpected requests: ${JSON.stringify(fetcher.requests, null, 2)}`);
+		expect(JSON.stringify(completionRequest.options.json)).toContain(snippet);
 	});
 
 	describe('inline completion classification', () => {
